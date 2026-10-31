@@ -96,9 +96,12 @@ jobs:
       run: |
         P=$(RADE_HOST=$ARM_HOST tools/rade/build.sh)
         echo "ARM_PREFIX=$P" >> "$GITHUB_ENV"
-        ls -l "$P/lib"
-        echo "NEON symbols in libopus.a: $(${ARM_HOST}-nm "$P/lib/libopus.a" 2>/dev/null | grep -ci neon)"
-        echo "NEON symbols in librade.a: $(${ARM_HOST}-nm "$P/lib/librade.a" 2>/dev/null | grep -ci neon)"
+        mkdir -p "$RUNNER_TEMP/out"
+        {
+          ls -l "$P/lib"
+          echo "NEON symbols in libopus.a: $(${ARM_HOST}-nm "$P/lib/libopus.a" 2>/dev/null | grep -ci neon)"
+          echo "NEON symbols in librade.a: $(${ARM_HOST}-nm "$P/lib/librade.a" 2>/dev/null | grep -ci neon)"
+        } | tee "$RUNNER_TEMP/out/build.txt"
 
     # The compile line of tools/freedv_test.sh, with the cross compiler: keep the two in step
     - name: Cross build of the test (src/freedv_rx.c and tools/freedv_test.c)
@@ -149,8 +152,22 @@ jobs:
         vals = np.r_[cc[0:maxlag + 1], cc[N - maxlag:N]]
         i = int(np.argmax(vals))
         corr = float(vals[i] / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-9))
-        print(f"max normalised correlation {corr:.4f} at lag {int(lags[i])} samples (+-100 ms searched)")
-        print("OK: same speech" if corr > 0.9 else "WARN: the speech differs, look at the two logs (dropped input? sync?)")
+        print(f"waveform correlation {corr:.4f} at lag {int(lags[i])} samples (+-100 ms searched)")
+        print("  (FARGAN is a neural vocoder: rounding differences x86 vs NEON shift the phase, so this one is")
+        print("   expected to be low even for identical speech; the verdict below uses the spectrogram)")
+
+        def stft(x, N=512, H=256):
+            w = np.hanning(N)
+            return np.array([np.abs(np.fft.rfft(x[j:j + N] * w)) for j in range(0, len(x) - N, H)])
+
+        A, B = stft(a), stft(b)
+        spec = float(np.corrcoef(np.log(A + 1).ravel(), np.log(B + 1).ravel())[0, 1])
+        env = float(np.corrcoef(np.log(A.sum(1) + 1), np.log(B.sum(1) + 1))[0, 1])
+        print(f"log-spectrogram correlation {spec:.4f}   loudness-envelope correlation {env:.4f}")
+        if spec > 0.9 and env > 0.98:
+            print("OK: same speech")
+        else:
+            print("WARN: the speech differs, look at the two logs (dropped input? sync?)")
         PY
 
     - name: Summary
@@ -161,7 +178,7 @@ jobs:
           echo
           echo "Clip: first ${CLIP_S} s of rade_c's FDV_offair.wav; ARM pace ${ARM_SPEED}x real time, under qemu."
           echo
-          for f in native arm compare; do
+          for f in build native arm compare; do
             [ -f "$RUNNER_TEMP/out/$f.txt" ] && { echo "**$f**"; echo '```'; cat "$RUNNER_TEMP/out/$f.txt"; echo '```'; }
           done
           echo "The speed under qemu says nothing about the radio's CPU: measure decode_ms_max and synth_ms_max on the radio."
