@@ -1,0 +1,176 @@
+# RADE on ARMv7: does tools/rade/build.sh cross-build for the radio's CPU, and does the decoder
+# give the same speech there as on a PC?
+#
+# Builds freedv/rade_c and Opus (FARGAN) with the ARM cross compiler (Cortex-A7, NEON, hard float),
+# builds tools/freedv_test.c and src/freedv_rx.c against them, runs it under qemu-arm (-cpu cortex-a7)
+# on a clip of rade_c's real off-air recording and compares the output with the same run on the
+# runner's x86. What this CANNOT tell: how fast the A33 is. qemu's speed says nothing about it; the
+# decode_ms_max in the ARM log is qemu's. Real time is measured on the radio.
+#
+# Starts on a push to this branch, or by hand (Actions > RADE ARM spike > Run workflow, a branch to
+# test and the length and pace of the clip can be given). The code under test is checked out from `ref`
+# (default feature/rade-rx); this file only has to be on the branch that is pushed or run.
+name: RADE ARM spike
+
+on:
+  push:
+    branches: [ci/rade-arm-spike]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch or commit to test (needs tools/rade/build.sh and tools/freedv_test.c)
+        default: feature/rade-rx
+      clip_s:
+        description: Seconds of the off-air recording to decode
+        default: "30"
+      arm_speed:
+        description: Pace of the ARM run, 1 = real time, 0.2 = five times slower (qemu is slow)
+        default: "0.2"
+
+permissions:
+  contents: read
+
+jobs:
+  spike:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash
+    env:
+      TEST_REF: ${{ inputs.ref || 'feature/rade-rx' }}
+      CLIP_S: ${{ inputs.clip_s || '30' }}
+      ARM_SPEED: ${{ inputs.arm_speed || '0.2' }}
+      ARM_HOST: arm-linux-gnueabihf
+      ARM_FLAGS: -mtune=cortex-a7 -mcpu=cortex-a7 -mfloat-abi=hard -mfpu=neon-vfpv4
+
+    steps:
+    - name: Checkout the code under test
+      uses: actions/checkout@v4
+      with:
+        ref: ${{ inputs.ref || 'feature/rade-rx' }}
+
+    - name: What is tested
+      run: |
+        echo "ref: $TEST_REF  commit: $(git rev-parse HEAD)"
+        git log -1 --format='%h %s'
+        for f in tools/rade/build.sh tools/freedv_test.c tools/freedv_test.sh src/freedv_rx.c src/freedv_rx.h; do
+          [ -f "$f" ] || { echo "::error::$f is not in $TEST_REF"; exit 1; }
+        done
+
+    - name: Tools (ARM cross compiler, qemu, what Opus's autogen.sh needs)
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends \
+          gcc-arm-linux-gnueabihf libc6-dev-armhf-cross libc6-armhf-cross qemu-user \
+          autoconf automake libtool wget unzip patch ffmpeg python3-numpy
+        ${ARM_HOST}-gcc --version | head -1
+        qemu-arm --version | head -1
+
+    # tools/rade/build.sh keeps its builds here, one prefix per target and per version of the script
+    - name: Cache of the RADE builds
+      uses: actions/cache@v4
+      with:
+        path: ~/.cache/openx6x00/rade
+        key: rade-${{ runner.os }}-${{ hashFiles('tools/rade/build.sh') }}
+
+    - name: Test recording (rade_c's off-air file, the commit tools/rade/build.sh pins)
+      run: |
+        commit=$(sed -n 's/^RADE_C_COMMIT=\([0-9a-f]\{40\}\).*/\1/p' tools/rade/build.sh)
+        [ -n "$commit" ] || { echo "::error::no RADE_C_COMMIT in tools/rade/build.sh"; exit 1; }
+        git clone -q --filter=blob:none https://github.com/freedv/rade_c "$RUNNER_TEMP/rade_c"
+        git -C "$RUNNER_TEMP/rade_c" -c advice.detachedHead=false checkout -q "$commit"
+        ffprobe -v error -show_entries stream=sample_rate,channels,duration -of default=nw=1 "$RUNNER_TEMP/rade_c/FDV_offair.wav"
+        # 11025 Hz mono, what the GUI's audio thread delivers
+        ffmpeg -loglevel error -y -t "$CLIP_S" -i "$RUNNER_TEMP/rade_c/FDV_offair.wav" \
+          -ar 11025 -ac 1 -c:a pcm_s16le "$RUNNER_TEMP/clip.wav"
+        ls -l "$RUNNER_TEMP/clip.wav"
+
+    # The reference: the same module, native, through the script the branch has for it
+    - name: Native run on the runner (x86)
+      run: |
+        mkdir -p "$RUNNER_TEMP/out"
+        tools/freedv_test.sh "$RUNNER_TEMP/clip.wav" "$RUNNER_TEMP/out/native.wav" 5 | tee "$RUNNER_TEMP/out/native.txt"
+
+    - name: Cross build of RADE (ARMv7, NEON)
+      run: |
+        P=$(RADE_HOST=$ARM_HOST tools/rade/build.sh)
+        echo "ARM_PREFIX=$P" >> "$GITHUB_ENV"
+        ls -l "$P/lib"
+        echo "NEON symbols in libopus.a: $(${ARM_HOST}-nm "$P/lib/libopus.a" 2>/dev/null | grep -ci neon)"
+        echo "NEON symbols in librade.a: $(${ARM_HOST}-nm "$P/lib/librade.a" 2>/dev/null | grep -ci neon)"
+
+    # The compile line of tools/freedv_test.sh, with the cross compiler: keep the two in step
+    - name: Cross build of the test (src/freedv_rx.c and tools/freedv_test.c)
+      run: |
+        P=$ARM_PREFIX
+        ${ARM_HOST}-gcc -O2 -Wall -Wextra $ARM_FLAGS -DRADE_ENABLED=1 -I src -I . \
+          -I "$P/include/rade" -I "$P/include/opus" -I "$P/include/opus/dnn" -I "$P/include/opus/celt" -I "$P/include/opus/include" \
+          tools/freedv_test.c src/freedv_rx.c src/olivia_resamp.c -o "$RUNNER_TEMP/freedv_test_arm" \
+          "$P/lib/librade.a" -Wl,--whole-archive "$P/lib/libopus.a" -Wl,--no-whole-archive -lm -lpthread
+        file "$RUNNER_TEMP/freedv_test_arm"
+        ${ARM_HOST}-size "$RUNNER_TEMP/freedv_test_arm"
+
+    - name: ARM run under qemu-arm (Cortex-A7)
+      timeout-minutes: 90
+      run: |
+        # Illegal instruction here = code the A7 does not have (the flags above are the radio's)
+        qemu-arm -cpu cortex-a7 -L /usr/arm-linux-gnueabihf "$RUNNER_TEMP/freedv_test_arm" \
+          "$RUNNER_TEMP/clip.wav" "$RUNNER_TEMP/out/arm.wav" "$ARM_SPEED" | tee "$RUNNER_TEMP/out/arm.txt"
+
+    - name: Compare ARM with native
+      run: |
+        python3 - "$RUNNER_TEMP/out/native.wav" "$RUNNER_TEMP/out/arm.wav" <<'PY' | tee "$RUNNER_TEMP/out/compare.txt"
+        import sys, wave
+        import numpy as np
+
+        def load(p):
+            with wave.open(p) as w:
+                assert w.getnchannels() == 1 and w.getsampwidth() == 2, p
+                return np.frombuffer(w.readframes(w.getnframes()), dtype='<i2').astype(np.float64), w.getframerate()
+
+        a, ra = load(sys.argv[1])
+        b, rb = load(sys.argv[2])
+        print(f"native: {len(a)/ra:.1f} s   arm: {len(b)/rb:.1f} s")
+        if len(b) == 0:
+            print("::error::the ARM run produced no speech")
+            sys.exit(1)
+        if len(a) == 0:
+            print("::error::the native run produced no speech")
+            sys.exit(1)
+        n = min(len(a), len(b))
+        a, b = a[:n], b[:n]
+        rms = lambda x: float(np.sqrt(np.mean(x * x)))
+        print(f"rms native {rms(a):.1f}   arm {rms(b):.1f}")
+        N = 1 << (2 * n - 1).bit_length()
+        cc = np.fft.irfft(np.fft.rfft(a, N) * np.conj(np.fft.rfft(b, N)), N)
+        maxlag = int(0.1 * ra)
+        lags = np.r_[0:maxlag + 1, -maxlag:0]
+        vals = np.r_[cc[0:maxlag + 1], cc[N - maxlag:N]]
+        i = int(np.argmax(vals))
+        corr = float(vals[i] / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-9))
+        print(f"max normalised correlation {corr:.4f} at lag {int(lags[i])} samples (+-100 ms searched)")
+        print("OK: same speech" if corr > 0.9 else "WARN: the speech differs, look at the two logs (dropped input? sync?)")
+        PY
+
+    - name: Summary
+      if: always()
+      run: |
+        {
+          echo "### RADE ARM spike: \`$TEST_REF\` @ $(git rev-parse --short HEAD)"
+          echo
+          echo "Clip: first ${CLIP_S} s of rade_c's FDV_offair.wav; ARM pace ${ARM_SPEED}x real time, under qemu."
+          echo
+          for f in native arm compare; do
+            [ -f "$RUNNER_TEMP/out/$f.txt" ] && { echo "**$f**"; echo '```'; cat "$RUNNER_TEMP/out/$f.txt"; echo '```'; }
+          done
+          echo "The speed under qemu says nothing about the radio's CPU: measure decode_ms_max and synth_ms_max on the radio."
+        } >> "$GITHUB_STEP_SUMMARY"
+
+    - name: Keep the outputs
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: rade-arm-spike
+        path: ${{ runner.temp }}/out/
+        if-no-files-found: ignore
