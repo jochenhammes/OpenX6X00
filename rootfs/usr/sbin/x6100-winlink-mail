@@ -605,6 +605,8 @@ def cmd_status():
     out = {"enabled": conf.get("enabled") == "1", "state": sup.get("state", "off"), "text": sup.get("text", "Off"),
            "password": password_where(), "modem": sup.get("modem", "off"), "mycall": conf.get("mycall", ""),
            "transport": transport(), "last_text": sup.get("last_text", ""), "last_next": sup.get("last_next", ""),
+           "last_result": sup.get("last_result", ""), "last_gateway": sup.get("last_gateway", ""),
+           "last_time": int(sup["last_time"]) if sup.get("last_time", "").isdigit() else 0,
            "pat": False, "connected": False, "dialing": False}
     st = pat_status() if out["enabled"] else None
     if st is not None:
