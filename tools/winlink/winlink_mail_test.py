@@ -6,6 +6,7 @@ a mailbox under a temporary root (X6100_WINLINK_ROOT), as x6100-winlink lays the
 run as the GUI runs it, and its answers checked:
 
 - status: Winlink on, Pat answering, the counts; off: nothing asked of Pat;
+- view: status and a list in one; abort with no connection under way;
 - send: the checks (no recipient, no subject, no text, a subject too long), then a message into the outbox;
 - list and read: the outbox, a message moved to the inbox and marked unread there, read (and so marked read);
 - delete;
@@ -235,8 +236,12 @@ def run(root):
           and "N0ONE" in lst[0]["to"] and "someone@example.com" in lst[0]["to"], f"list out: {lst}")
     mid = lst[0]["mid"] if lst else "X"
     rc, m, _ = helper(root, "read", "out", mid)
-    check(rc == 0 and m["body"].replace("\r\n", "\n").strip() == body and m["cc"] == "N0TWO"
-          and m["attachments"] == [], f"read out: {m}")
+    check(rc == 0 and m["body"].strip() == body.replace("äöü", "aeoeue") and m["cc"] == "N0TWO"
+          and m["attachments"] == [], f"read out, in ASCII for the radio's fonts: {m}")
+    rc, v, _ = helper(root, "view", "out")
+    check(rc == 0 and v["status"]["out"] == 1 and [x["mid"] for x in v["list"]] == [mid], f"view: {v}")
+    rc, out, _ = helper(root, "abort")
+    check(rc == 1 and "no connection" in out["error"], f"abort with no connection: {out}")
 
     # into the inbox (Pat's move, as its web page does), unread there
     st_, _ = pat_api(root, "POST", "/api/mailbox/in", headers={"X-Pat-SourcePath": f"/api/mailbox/out/{mid}"})

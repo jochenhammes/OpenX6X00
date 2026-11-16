@@ -9,6 +9,8 @@
 #                                        a session under way, the password's place, the mailbox counts
 #   x6100-winlink-mail list in|out|sent|archive
 #                                        the messages, newest first, without their bodies (a JSON array)
+#   x6100-winlink-mail view BOX          status and list in one: {"status": ..., "list": [...]} (one start of
+#                                        Python on the radio instead of two)
 #   x6100-winlink-mail read BOX MID      one message with its body; in the inbox it is marked read
 #   x6100-winlink-mail send              a new message into Pat's outbox, from a JSON object on stdin:
 #                                        {"to": "...", "cc": "...", "subject": "...", "body": "..."}
@@ -21,8 +23,11 @@
 #                                        stdin, a line each: {"prompt": {"id": ..., "value": ...}} answers one of
 #                                        Pat's questions (a busy channel, the password), "abort" ends the
 #                                        connection, "abort!" at once
+#   x6100-winlink-mail abort             ends Pat's connection under way, one the GUI no longer follows
 #
 # Every other command answers one JSON object or array; a failure is {"error": "..."} and the exit status 1.
+# The text to show is ASCII, as the GUI's fonts are: a letter with an accent loses it, an umlaut is written out
+# (ae, oe, ue, ss), what has no such form is "?". What is sent is as typed.
 # Pat's HTTP guard (tools/pat, 0001) takes 127.0.0.1 as the Host; what changes something is sent with jQuery's
 # X-Requested-With, as Pat's own page sends it.
 #
@@ -40,6 +45,11 @@ import sys
 import threading
 import time
 import urllib.parse
+
+try:
+    import unicodedata
+except ImportError:                    # a Python built without it: the table below only
+    unicodedata = None
 
 ROOT = os.environ.get("X6100_WINLINK_ROOT", "")   # tests on a PC only: every path below under it
 CONF = ROOT + "/mnt/winlink.conf"
@@ -169,11 +179,36 @@ def when(s):
         return "", 0
 
 
+FOLD = {"ä": "ae", "ö": "oe", "ü": "ue", "Ä": "Ae", "Ö": "Oe", "Ü": "Ue", "ß": "ss", "æ": "ae", "Æ": "AE",
+        "ø": "o", "Ø": "O", "å": "a", "Å": "A", "œ": "oe", "Œ": "OE", "ł": "l", "Ł": "L", "đ": "d", "Đ": "D",
+        "\u2018": "'", "\u2019": "'", "\u201a": "'", "\u201c": '"', "\u201d": '"', "\u201e": '"', "\u2013": "-",
+        "\u2014": "-", "\u2026": "...", "\u00a0": " ", "\u00b0": "deg", "\u20ac": "EUR", "\u00b5": "u"}
+
+
+def ascii_char(c):
+    if " " <= c <= "~" or c in "\n\t":
+        return c
+    if c in FOLD:
+        return FOLD[c]
+    if unicodedata is not None:
+        base = "".join(b for b in unicodedata.normalize("NFKD", c) if " " <= b <= "~")
+        if base:
+            return base
+    return "?" if ord(c) >= 160 else " "
+
+
 def clean(text, limit):
-    """Text for the radio's screen: no control characters but the line ends and tabs, at most limit characters"""
+    """Text for the radio's screen: ASCII, no control characters but the line ends and tabs, at most limit
+    characters"""
     text = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
-    text = "".join(c if c in "\n\t" or (ord(c) >= 32 and ord(c) != 127) else " " for c in text)
-    return text[:limit]
+    out, n = [], 0
+    for c in text:
+        a = ascii_char(c)
+        out.append(a)
+        n += len(a)
+        if n >= limit:
+            break
+    return "".join(out)[:limit]
 
 
 def one_line(text, limit):
@@ -551,6 +586,19 @@ def cmd_session(url):
 
 # ---- status -----------------------------------------------------------------------------------------------------
 
+def cmd_abort():
+    status, data = request("POST", "/api/disconnect")
+    if status != 200:
+        raise Fail("no connection to end")
+    return {"ok": True}
+
+
+def cmd_view(box):
+    check_box(box)
+    st = cmd_status()
+    return {"status": st, "list": cmd_list(box) if st["pat"] else []}
+
+
 def cmd_status():
     sup = read_kv(STATUS)
     conf = read_kv(CONF)
@@ -575,7 +623,8 @@ def cmd_status():
 
 def main(argv):
     cmds = {"status": (cmd_status, 0), "list": (cmd_list, 1), "read": (cmd_read, 2), "send": (cmd_send, 0),
-            "delete": (cmd_delete, 2), "gateways": (cmd_gateways, None), "session": (cmd_session, 1)}
+            "delete": (cmd_delete, 2), "gateways": (cmd_gateways, None), "session": (cmd_session, 1),
+            "view": (cmd_view, 1), "abort": (cmd_abort, 0)}
     if not argv or argv[0] not in cmds:
         sys.stderr.write("usage: x6100-winlink-mail " + "|".join(cmds) + " ...\n")
         return 2
