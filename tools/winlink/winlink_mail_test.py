@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Host test of rootfs/usr/sbin/x6100-winlink-mail (APP > Mail, #294) against a real Pat.
 
-Pat v1.0.0 with tools/pat/patches, built for this PC, runs its HTTP API on a port of its own, with a config and
+Pat v1.0.1 with tools/pat/patches, built for this PC, runs its HTTP API on a port of its own, with a config and
 a mailbox under a temporary root (X6100_WINLINK_ROOT), as x6100-winlink lays them out on the radio. The helper is
 run as the GUI runs it, and its answers checked:
 
@@ -236,8 +236,24 @@ def run(root):
           and "N0ONE" in lst[0]["to"] and "someone@example.com" in lst[0]["to"], f"list out: {lst}")
     mid = lst[0]["mid"] if lst else "X"
     rc, m, _ = helper(root, "read", "out", mid)
-    check(rc == 0 and m["body"].strip() == body.replace("äöü", "aeoeue") and m["cc"] == "N0TWO"
-          and m["attachments"] == [], f"read out, in ASCII for the radio's fonts: {m}")
+    check(rc == 0 and m["body"].strip() == body and m["cc"] == "N0TWO"
+          and m["attachments"] == [], f"read out, its Latin-1 kept for the radio's fonts: {m}")
+    # Latin-1 as typed; what is beyond it written out, before Pat would make it "?"
+    rc, out, _ = helper(root, "send", stdin=json.dumps({"to": "N0ONE", "subject": "Grüße aus Köln",
+                                                         "body": "„Łódź“ – 5 € …"}))
+    rc2, lst2, _ = helper(root, "list", "out")
+    m2 = [x for x in lst2 if x["subject"].startswith("Gr")] if rc2 == 0 else []
+    rc3, r2, _ = helper(root, "read", "out", m2[0]["mid"]) if m2 else (1, {}, "")
+    check(rc == 0 and m2 and m2[0]["subject"] == "Grüße aus Köln" and rc3 == 0
+          and r2["body"].strip() == '"Lódz" - 5 EUR ...', f"Latin-1 kept, the rest written out: {r2.get('body')!r}")
+    rc, out, _ = helper(root, "send", stdin=json.dumps({"to": "N0ONE", "subject": "a\u2013b", "body": "x"}))
+    rc2, lst2, _ = helper(root, "list", "out")
+    m3 = [x for x in lst2 if x["subject"] == "a-b"] if rc2 == 0 else []
+    check(rc == 0 and len(m3) == 1, f"a subject with a dash beyond Latin-1 goes out as a-b: {lst2}")
+    for x in m3:
+        helper(root, "delete", "out", x["mid"])
+    if m2:
+        helper(root, "delete", "out", m2[0]["mid"])
     rc, v, _ = helper(root, "view", "out")
     check(rc == 0 and v["status"]["out"] == 1 and [x["mid"] for x in v["list"]] == [mid], f"view: {v}")
     rc, out, _ = helper(root, "abort")
@@ -288,6 +304,9 @@ def run(root):
     rc, gws, _ = helper(root, "gateways")
     check(rc == 0 and gws[0]["url"] == url and gws[0]["recent"] and gws[0]["call"] == "N0GWB",
           "the gateway last connected to on top")
+    rc, gws20, _ = helper(root, "gateways", "20m")
+    check(rc == 0 and [g["call"] for g in gws20] == ["N0GWA"] and not gws20[0]["recent"],
+          f"on 20 m the 40 m gateway called lately is not on top: {gws20}")
     rc, out, _ = helper(root, "session", "http://evil/?x")
     check(rc == 1 and "address" in out["error"], "session: not a gateway's address")
 

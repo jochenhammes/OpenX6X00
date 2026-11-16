@@ -51,8 +51,11 @@
 
 extern char **environ;
 
-#define HELPER        "x6100-winlink-mail"
-#define SUPERVISOR    "x6100-winlink"
+#ifndef X6100_SBIN
+#define X6100_SBIN    "/usr/sbin"
+#endif
+#define HELPER        X6100_SBIN "/x6100-winlink-mail"
+#define SUPERVISOR    X6100_SBIN "/x6100-winlink"
 #define OUT_MAX       (2 * 1024 * 1024)  /* bytes of a helper's answer read */
 #define ROW_H         30
 #define LOG_LINES     6
@@ -122,6 +125,18 @@ static time_t note_until;
 
 static time_t confirm_until;         /* Connect or Delete pressed once */
 static int    confirm_what;          /* 1 Connect, 2 Delete */
+static char   confirm_url[220];      /* the gateway Connect was pressed for */
+
+/* A view's number: a job's answer for a view that is gone (left, or built again) changes no view */
+static unsigned view_seq, res_seq;
+static int      res_tag;             /* the job's box (a list) or band (the gateways) */
+static bool     gateways_wanted;     /* the gateway list asked while a job ran */
+static int      saved_sel, saved_top;   /* the message list's, while sel and top are the gateways' */
+static bool     sel_is_gw;
+
+/* A message being written, kept while Pat's question takes the screen; New brings it back */
+static char *draft[4];
+static int   draft_field;
 
 /* Compose */
 #define FIELDS 4
@@ -160,17 +175,21 @@ typedef void (*job_cb_t)(int rc, cJSON *out);
 
 typedef struct {
     job_cb_t cb;
-    unsigned gen;
+    unsigned gen, seq;
+    int      tag;
     int      rc;
     char    *out;
 } job_res_t;
 
 typedef struct {
     job_cb_t cb;
-    unsigned gen;
+    unsigned gen, seq;
+    int      tag;
     char    *argv[6];
     char    *in;
 } job_t;
+
+static void load_gateways(void);
 
 /* A helper with its stdin on a socket (the GUI never dies of SIGPIPE writing to one that has gone: MSG_NOSIGNAL) and
  * its stdout on a pipe; its stderr to nowhere. -1: it did not start */
@@ -249,8 +268,16 @@ static void job_done_cb(void *arg) {
         out = cJSON_Parse(r->out);
     }
     free(r->out);
+    res_seq = r->seq;
+    res_tag = r->tag;
     r->cb(r->rc, out);
     cJSON_Delete(out);
+    if (gateways_wanted && !job_busy) {
+        gateways_wanted = false;
+        if (view == V_GATEWAYS) {
+            load_gateways();
+        }
+    }
     if (refresh_wanted && !job_busy) {
         refresh_wanted = false;
         refresh();
@@ -259,7 +286,7 @@ static void job_done_cb(void *arg) {
 
 static void *job_thread(void *arg) {
     job_t    *j = arg;
-    job_res_t r = {.cb = j->cb, .gen = j->gen, .rc = -1, .out = NULL};
+    job_res_t r = {.cb = j->cb, .gen = j->gen, .seq = j->seq, .tag = j->tag, .rc = -1, .out = NULL};
     int       out_fd, in_fd;
     pid_t     pid = spawn_helper(j->argv, &out_fd, &in_fd);
 
@@ -305,7 +332,10 @@ static void *job_thread(void *arg) {
     for (int i = 0; j->argv[i]; i++) {
         free(j->argv[i]);
     }
-    free(j->in);
+    if (j->in) {
+        memset(j->in, 0, strlen(j->in));     /* a password, for one */
+        free(j->in);
+    }
     free(j);
     for (int tries = 0; !scheduler_put(job_done_cb, &r, sizeof(r)); tries++) {
         if (tries > 50) {     /* the queue full for 5 s: the answer is lost, the next refresh asks again */
@@ -317,8 +347,9 @@ static void *job_thread(void *arg) {
     return NULL;
 }
 
-/* One job at a time; false (and nothing run) while one runs */
-static bool job_start(job_cb_t cb, const char *in, const char *a0, const char *a1, const char *a2, const char *a3) {
+/* One job at a time; false (and nothing run) while one runs. tag: what its answer is for (res_tag then) */
+static bool job_start_tag(job_cb_t cb, int tag, const char *in, const char *a0, const char *a1, const char *a2,
+                          const char *a3) {
     pthread_t      t;
     pthread_attr_t attr;
     job_t         *j;
@@ -334,6 +365,8 @@ static bool job_start(job_cb_t cb, const char *in, const char *a0, const char *a
     }
     j->cb  = cb;
     j->gen = gen;
+    j->seq = view_seq;
+    j->tag = tag;
     for (int i = 0; i < 4 && a[i]; i++) {
         j->argv[n++] = strdup(a[i]);
     }
@@ -352,6 +385,10 @@ static bool job_start(job_cb_t cb, const char *in, const char *a0, const char *a
     pthread_attr_destroy(&attr);
     job_busy = true;
     return true;
+}
+
+static bool job_start(job_cb_t cb, const char *in, const char *a0, const char *a1, const char *a2, const char *a3) {
+    return job_start_tag(cb, 0, in, a0, a1, a2, a3);
 }
 
 /* ---- Small things ------------------------------------------------------------------------------------------------ */
@@ -390,12 +427,17 @@ static void say(const char *fmt, ...) {
     show();
 }
 
+static void plain(char *dst, size_t size, const char *src);
+
 static bool failed(int rc, const cJSON *out, const char *what) {
     if (rc == 0 && out) {
         return false;
     }
     if (out && jstr(out, "error")[0]) {
-        say("#%06x %s:# %s", theme_hex(TC_err), what, jstr(out, "error"));
+        char e[200];
+
+        plain(e, sizeof(e), jstr(out, "error"));
+        say("#%06x %s:# %s", theme_hex(TC_err), what, e);
     } else if (rc < 0 || rc == 127) {
         say("#%06x %s:# " HELPER " did not run", theme_hex(TC_err), what);
     } else {
@@ -449,19 +491,23 @@ static void view_done(int rc, cJSON *out) {
         cJSON_Delete(status);
         status = st;
     }
-    if (ls && cJSON_IsArray(ls)) {
+    if (ls && cJSON_IsArray(ls) && res_tag != box_i) {
+        cJSON_Delete(ls);           /* the box before Box was pressed: the one shown now is asked again */
+        refresh_wanted = true;
+    } else if (ls && cJSON_IsArray(ls)) {
         char keep[16] = "";
+        int *s        = sel_is_gw ? &saved_sel : &sel;     /* the list's selection, also under the gateways */
 
-        if (list && sel < cJSON_GetArraySize(list)) {
-            snprintf(keep, sizeof(keep), "%s", jstr(cJSON_GetArrayItem(list, sel), "mid"));
+        if (list && *s < cJSON_GetArraySize(list)) {
+            snprintf(keep, sizeof(keep), "%s", jstr(cJSON_GetArrayItem(list, *s), "mid"));
         }
         cJSON_Delete(list);
         list = ls;
         /* the selection stays on its message when one came in above it */
-        sel = 0;
+        *s = 0;
         for (int i = 0; keep[0] && i < cJSON_GetArraySize(list); i++) {
             if (!strcmp(jstr(cJSON_GetArrayItem(list, i), "mid"), keep)) {
-                sel = i;
+                *s = i;
                 break;
             }
         }
@@ -490,7 +536,7 @@ static void view_done(int rc, cJSON *out) {
 }
 
 static void refresh(void) {
-    if (!job_start(view_done, NULL, HELPER, "view", boxes[box_i], NULL)) {
+    if (!job_start_tag(view_done, box_i, NULL, HELPER, "view", boxes[box_i], NULL)) {
         refresh_wanted = true;
     }
 }
@@ -539,7 +585,7 @@ static void row_set(int i, bool on, bool strong, const char *a, const char *b, c
         uint32_t  color = on ? theme_hex(TC_sel_text) : strong ? theme_hex(TC_accent_soft)
                                                      : k == 1 ? COLOR_DIM : theme_hex(TC_text);
 
-        lv_label_set_text(l, t[k]);
+        (lv_label_set_text)(l, t[k]);      /* mail and callsigns: past the language hook (i18n_hook.h) */
         lv_obj_set_style_text_color(l, lv_color_hex(color), 0);
     }
 }
@@ -673,13 +719,14 @@ static void show_gateways(void) {
         lv_obj_add_flag(empty_lbl, LV_OBJ_FLAG_HIDDEN);
     } else {
         lv_obj_clear_flag(empty_lbl, LV_OBJ_FLAG_HIDDEN);
-        lv_label_set_text(empty_lbl, job_busy ? "Reading Pat's gateway list..." : "No gateway on this band.");
+        lv_label_set_text(empty_lbl, job_busy || gateways_wanted ? "Reading Pat's gateway list..."
+                                                                  : "No gateway on this band.");
     }
 }
 
 static void build_read(void) {
     lv_obj_t *head, *text;
-    char      buf[900], line[260];
+    char      buf[1400], line[260];
 
     lv_obj_clean(body);
     read_box = lv_obj_create(body);
@@ -703,19 +750,33 @@ static void build_read(void) {
         plain(to, sizeof(to), jstr(message, "to"));
         plain(cc, sizeof(cc), jstr(message, "cc"));
         plain(subj, sizeof(subj), jstr(message, "subject"));
-        snprintf(buf, sizeof(buf), "From #%06x %s#   %s UTC\nTo #%06x %s#", theme_hex(TC_text), from,
-                 jstr(message, "date"), theme_hex(TC_text), to);
+        /* the words translated here, the mail's own text past the language hook (i18n_hook.h): a line of it that
+         * reads like one of the GUI's would be translated too */
+        snprintf(buf, sizeof(buf), "%s #%06x %s#   %s UTC\n", _("From"), theme_hex(TC_text), from,
+                 jstr(message, "date"));
+        snprintf(line, sizeof(line), "%s #%06x %s#", _("To"), theme_hex(TC_text), to);
+        strncat(buf, line, sizeof(buf) - strlen(buf) - 1);
         if (cc[0]) {
-            snprintf(line, sizeof(line), "\nCc #%06x %s#", theme_hex(TC_text), cc);
+            snprintf(line, sizeof(line), "\n%s #%06x %s#", _("Cc"), theme_hex(TC_text), cc);
             strncat(buf, line, sizeof(buf) - strlen(buf) - 1);
         }
         snprintf(line, sizeof(line), "\n#%06x %s#", COLOR_HEAD, subj);
         strncat(buf, line, sizeof(buf) - strlen(buf) - 1);
         if (na) {
-            snprintf(line, sizeof(line), "\n%d attachment%s: in the web mailbox", na, na == 1 ? "" : "s");
+            const cJSON *a;
+
+            snprintf(line, sizeof(line), "\n%s:", _("Attachments, in the web mailbox"));
             strncat(buf, line, sizeof(buf) - strlen(buf) - 1);
+            cJSON_ArrayForEach(a, cJSON_GetObjectItemCaseSensitive(message, "attachments")) {
+                char name[90];
+
+                plain(name, sizeof(name), jstr(a, "name"));
+                snprintf(line, sizeof(line), " #%06x %s# (%d kB)", theme_hex(TC_text), name,
+                         (jint(a, "size", 0) + 1023) / 1024);
+                strncat(buf, line, sizeof(buf) - strlen(buf) - 1);
+            }
         }
-        lv_label_set_text(head, buf);
+        (lv_label_set_text)(head, buf);
     }
 
     text = label(read_box, &sony_22, theme_hex(TC_text));
@@ -735,7 +796,7 @@ static void build_read(void) {
             if (jbool(message, "cut")) {
                 strcat(t, "\n\n[the rest is in the web mailbox]");
             }
-            lv_label_set_text(text, t);
+            (lv_label_set_text)(text, t);     /* the mail itself: past the language hook */
             free(t);
         }
     }
@@ -913,7 +974,7 @@ static void show_session(void) {
         strncat(buf, line, sizeof(buf) - strlen(buf) - 2);
         strcat(buf, "\n");
     }
-    lv_label_set_text(l2, buf);
+    (lv_label_set_text)(l2, buf);   /* Pat's and the gateway's words: past the language hook */
 }
 
 /* The header, the status line, and the view's body */
@@ -983,7 +1044,7 @@ static void show(void) {
     } else if (view == V_READ) {
         lv_label_set_text(frame.status, "Up / Down or MFK: scroll - R: reply - Esc: back");
     } else if (view == V_GATEWAYS) {
-        lv_label_set_text(frame.status, "+ connected to lately - Connect twice: the radio transmits");
+        lv_label_set_text(frame.status, "+ called lately - Connect twice: the radio transmits");
     } else if (view == V_SESSION && sess_on) {
         lv_label_set_text(frame.status, "Abort ends the connection; Back leaves it running");
     } else if (view == V_LIST) {
@@ -1152,9 +1213,18 @@ static void load_page(void) {
 }
 
 static void set_view(view_t v) {
+    if (v == V_LIST && sel_is_gw) {     /* back from the gateways: the message chosen before */
+        sel       = saved_sel;
+        top       = saved_top;
+        sel_is_gw = false;
+    }
     view          = v;
+    view_seq++;
     confirm_until = 0;
     note[0]       = 0;     /* what was said is about the view left */
+    if (v != V_COMPOSE) {
+        memset(fields, 0, sizeof(fields));    /* deleted with the body's children below */
+    }
     switch (v) {
         case V_LIST:
         case V_GATEWAYS:
@@ -1204,6 +1274,9 @@ static void box_cb(button_data_t *b) {
 }
 
 static void read_done(int rc, cJSON *out) {
+    if (res_seq != view_seq) {
+        return;     /* asked from a view that is gone: a message being written is not thrown away for it */
+    }
     if (failed(rc, out, "Read")) {
         return;
     }
@@ -1225,6 +1298,10 @@ static void open_selected(void) {
 }
 
 static void delete_done(int rc, cJSON *out) {
+    if (res_seq != view_seq) {
+        refresh();
+        return;
+    }
     if (failed(rc, out, "Delete")) {
         return;
     }
@@ -1287,6 +1364,40 @@ static void refresh_cb(button_data_t *b) {
 
 /* ---- Writing ----------------------------------------------------------------------------------------------------- */
 
+static void draft_free(void) {
+    for (int i = 0; i < FIELDS; i++) {
+        free(draft[i]);
+        draft[i] = NULL;
+    }
+}
+
+/* The message being written, kept */
+static void draft_keep(void) {
+    draft_free();
+    for (int i = 0; i < FIELDS; i++) {
+        draft[i] = strdup(fields[i] ? lv_textarea_get_text(fields[i]) : "");
+    }
+    draft_field = field_i;
+}
+
+/* ... and back on the screen: false when none is kept */
+static bool draft_restore(void) {
+    if (!draft[0]) {
+        return false;
+    }
+    view = V_COMPOSE;
+    build_compose(NULL, NULL);
+    for (int i = 0; i < FIELDS; i++) {
+        lv_textarea_set_text(fields[i], draft[i] ? draft[i] : "");
+    }
+    field_i = draft_field;
+    draft_free();
+    set_view(V_COMPOSE);
+    show_fields();
+    say("The message you were writing");
+    return true;
+}
+
 static void new_cb(button_data_t *b) {
     (void)b;
     if (popup_first()) {
@@ -1294,6 +1405,9 @@ static void new_cb(button_data_t *b) {
     }
     if (!pat_up()) {
         say("Winlink is off: Winlink On (page 2) first");
+        return;
+    }
+    if (draft_restore()) {
         return;
     }
     view = V_COMPOSE;
@@ -1336,6 +1450,11 @@ static void next_field_cb(button_data_t *b) {
 }
 
 static void send_done(int rc, cJSON *out) {
+    if (res_seq != view_seq) {       /* the app went on meanwhile: said, and the view left as it is */
+        msg_schedule_text_fmt(rc == 0 ? "Winlink: the message is in the outbox" : "Winlink: the message was not sent");
+        refresh();
+        return;
+    }
     if (failed(rc, out, "Not sent")) {
         return;
     }
@@ -1383,6 +1502,10 @@ static void osk_end(void) {
 static bool osk_ok(void) {
     const char *val = textarea_window_get();
 
+    if (view != V_COMPOSE || !fields[field_i]) {
+        osk_end();
+        return true;
+    }
     if (field_i == FIELDS - 1) {
         if (val && *val) {
             lv_textarea_set_cursor_pos(fields[field_i], LV_TEXTAREA_CURSOR_LAST);
@@ -1439,6 +1562,10 @@ static void onoff_cb(button_data_t *b) {
     if (popup_first()) {
         return;
     }
+    if (!status) {
+        say("Wait: reading Winlink's state");    /* On or Off is not known yet */
+        return;
+    }
     if (pat_busy()) {
         say("A connection is under way: Abort it first");
         return;
@@ -1473,14 +1600,25 @@ static void password_done(int rc, cJSON *out) {
 
 static bool pw_ok(void) {
     const char *val = textarea_window_get();
+    size_t      n;
     char       *in;
 
-    if (!val || !*val) {
+    /* spaces around it dropped, as the web page drops them */
+    while (val && *val == ' ') {
+        val++;
+    }
+    n = val ? strlen(val) : 0;
+    while (n && val[n - 1] == ' ') {
+        n--;
+    }
+    if (!n) {
         return false;
     }
-    in = malloc(strlen(val) + 2);
+    in = malloc(n + 2);
     if (in) {
-        sprintf(in, "%s\n", val);
+        memcpy(in, val, n);
+        in[n]     = '\n';
+        in[n + 1] = 0;
         if (!job_start(password_done, in, SUPERVISOR, "set-password", NULL, NULL)) {
             say("Wait, still busy");
         }
@@ -1510,6 +1648,9 @@ static void password_cb(button_data_t *b) {
 /* ---- Gateways and the connection --------------------------------------------------------------------------------- */
 
 static void gateways_done(int rc, cJSON *out) {
+    if (view != V_GATEWAYS || res_tag != band_i) {
+        return;     /* left, or another band chosen meanwhile (its list is asked for already) */
+    }
     if (failed(rc, out, "Gateways")) {
         show();
         return;
@@ -1524,8 +1665,10 @@ static void load_gateways(void) {
     cJSON_Delete(gateways);
     gateways = cJSON_CreateArray();
     sel = top = 0;
-    if (!job_start(gateways_done, NULL, HELPER, "gateways", bands[band_i][0] ? bands[band_i] : NULL, NULL)) {
-        say("Wait, still busy");
+    confirm_until = 0;
+    if (!job_start_tag(gateways_done, band_i, NULL, HELPER, "gateways", bands[band_i][0] ? bands[band_i] : NULL,
+                       NULL)) {
+        gateways_wanted = true;     /* when the job running now is done */
     }
     show();
 }
@@ -1542,6 +1685,11 @@ static void connect_view_cb(button_data_t *b) {
     if (!pat_up()) {
         say("Winlink is off: Winlink On (page 2) first");
         return;
+    }
+    if (!sel_is_gw) {
+        saved_sel = sel;
+        saved_top = top;
+        sel_is_gw = true;
     }
     set_view(V_GATEWAYS);
     load_gateways();
@@ -1646,6 +1794,9 @@ static void prompt_answer(const char *value) {
         free(s);
     }
     prompt_clear();
+    if (view == V_SESSION && draft_restore()) {    /* back to the message Pat's question interrupted */
+        return;
+    }
     load_page();
     show();
 }
@@ -1673,6 +1824,9 @@ static bool prompt_pw_cancel(void) {
 static void prompt_cb(button_data_t *b) {
     int i = (int)b->ctrl;
 
+    if (osk_open_now) {
+        return;     /* the password's field is open already */
+    }
     if (!prompt_on || i < 0 || i > 2 || !prompt_values[i]) {
         return;
     }
@@ -1717,7 +1871,6 @@ static void prompt_show(const cJSON *p) {
         prompt_labels[i][0] = 0;
     }
     if (!strcmp(prompt_kind, "busy-channel")) {
-        snprintf(prompt_labels[0], sizeof(prompt_labels[0]), "Wait");
         snprintf(prompt_labels[1], sizeof(prompt_labels[1]), "Continue\nanyway");
         snprintf(prompt_labels[2], sizeof(prompt_labels[2]), "Abort");
         prompt_values[1] = "continue";
@@ -1760,6 +1913,9 @@ static void prompt_show(const cJSON *p) {
         lv_group_set_editing(keyboard_group, true);
     }
     msg_schedule_text_fmt("Winlink: Pat asks, see APP > Mail");
+    if (view == V_COMPOSE) {
+        draft_keep();       /* back after the answer, or with New */
+    }
     if (view != V_SESSION) {
         set_view(V_SESSION);
     } else {
@@ -1803,7 +1959,9 @@ static void session_line_cb(void *arg) {
     } else if ((o = cJSON_GetObjectItemCaseSensitive(ev, "prompt_abort"))) {
         if (cJSON_IsString(o) && !strcmp(o->valuestring, prompt_id)) {
             prompt_clear();   /* answered in the web mailbox, or Pat gave up asking */
-            load_page();
+            if (!(view == V_SESSION && draft_restore())) {
+                load_page();
+            }
         }
     } else if ((o = cJSON_GetObjectItemCaseSensitive(ev, "done"))) {
         int got = jint(o, "received", 0);
@@ -1839,7 +1997,12 @@ static void session_end_cb(void *arg) {
     if (!sess_result[0]) {
         snprintf(sess_result, sizeof(sess_result), "Ended");
     }
-    msg_schedule_text_fmt("Winlink: %s", sess_result);
+    {
+        char r[sizeof(sess_result)];
+
+        plain(r, sizeof(r), sess_result);
+        msg_schedule_text_fmt("Winlink: %s", r);
+    }
     load_page();
     show();
     refresh();
@@ -1865,11 +2028,16 @@ static void connect_cb(button_data_t *b) {
         say("A connection is under way");
         return;
     }
-    if (confirm_what != 1 || time(NULL) >= confirm_until) {
+    /* the second press for the gateway of the first only: another chosen meanwhile asks again */
+    if (confirm_what != 1 || time(NULL) >= confirm_until || strcmp(confirm_url, jstr(g, "url"))) {
+        char call[24];
+
+        plain(call, sizeof(call), jstr(g, "call"));
         confirm_what  = 1;
         confirm_until = time(NULL) + CONFIRM_S;
-        say("#%06x Connect to %s on %.1f kHz: press again, the radio transmits#", theme_hex(TC_warn),
-            jstr(g, "call"), jnum(g, "dial"));
+        snprintf(confirm_url, sizeof(confirm_url), "%s", jstr(g, "url"));
+        say("#%06x Connect to %s on %.1f kHz: press again, the radio transmits#", theme_hex(TC_warn), call,
+            jnum(g, "dial"));
         return;
     }
     confirm_until = 0;
@@ -1934,8 +2102,8 @@ static void abort_cb(button_data_t *b) {
         send_all(sess_in, again ? "abort!\n" : "abort\n");
         first = time(NULL);
         say(again ? "Ending the connection now" : "Ending the connection (Abort again: at once)");
-    } else if (pat_busy()) {
-        job_start(abort_done, NULL, HELPER, "abort", NULL, NULL);
+    } else if (pat_busy() && !job_start(abort_done, NULL, HELPER, "abort", NULL, NULL)) {
+        say("Wait, still busy: Abort again");
     }
 }
 
@@ -1949,6 +2117,10 @@ static bool from_encoder(void) {
 
 static void move_sel(int d) {
     sel += d;
+    if (confirm_until && confirm_what == 1) {   /* Connect's first press was for the gateway left */
+        confirm_until = 0;
+        note[0]       = 0;
+    }
     show();
 }
 

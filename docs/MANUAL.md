@@ -6993,12 +6993,14 @@ reaches the composer), ardopcf with its audio and PTT through the radio's GUI.
 
 ### Mail on the radio
 
-Since v0.3.13 (#294). APP > Mail (the APP grid's Mail tile, or APP 6:6)
-reads, writes and sends Winlink mail on the radio, with the touch screen, the
+Since v0.3.13 (#294). APP > Mail (the APP grid's Mail tile, APP 6:6, or a
+key's long press given APP Mail in Settings > Keys) reads, writes and sends
+Winlink mail on the radio, with the touch screen, the
 MFK or a USB or Bluetooth keyboard: no phone, no laptop and no WiFi. It is
 the same mailbox as Pat's web page: a message written on the radio shows in
 the web mailbox, and the other way round. Plain text only: a message's
-attachments are named, and they and Winlink forms stay in the web mailbox.
+attachments are named with their size, and they and Winlink forms stay in the
+web mailbox.
 
 - The list: Box goes through the Inbox, the Outbox (what the next
   connection sends) and Sent. Unread messages are marked with `*` and
@@ -7014,15 +7016,21 @@ attachments are named, and they and Winlink forms stay in the web mailbox.
   field; Enter or Down goes to the next field, and in the text Enter is a new
   line. Without one, the MFK chooses the field and a press (or Type) opens the
   on-screen keys: a field takes the whole line typed, the text a line at a
-  time. Send puts the message in the Outbox; Cancel twice drops it. The
-  radio's fonts have only plain letters: a message received with accents or
-  umlauts shows them written out (ae, oe, ue, ss).
+  time. Send puts the message in the Outbox; Cancel twice drops it. Pat
+  writes mail in Latin-1, as Winlink carries it: accents and umlauts go out
+  and show as they are, and what is beyond Latin-1 is written out (typographic
+  quotes and dashes as plain ones, the euro sign as EUR, Ł as L), where Pat
+  would put "?". If Pat asks something during a connection while you write,
+  its question comes first; the message comes back after the answer, or with
+  New.
 - Connect: Pat's gateway list for the modem chosen on the Winlink page (ARDOP,
   or the VARA HF gateways for Mercury and XARA), the nearest first, the ones
-  called from the radio lately on top (`+`). Band goes through the bands. The
+  called from the radio lately on top (`+`, on the band chosen). Band goes
+  through the bands. The
   list comes from the card: without internet Pat takes the one it last
-  downloaded, or the one it comes with. Connect, pressed twice (the second
-  press transmits), calls the gateway as Pat's Connect does, with the same
+  downloaded, or the one it comes with. Connect, pressed twice for the same
+  gateway (the second press transmits; another gateway chosen in between
+  asks again), calls the gateway as Pat's Connect does, with the same
   checks before each key (see above): the radio tunes there and Pat sends the
   Outbox and fetches the new mail. The Connection page shows Calling or
   Connected, the progress of each message on the bar, Pat's last log lines,

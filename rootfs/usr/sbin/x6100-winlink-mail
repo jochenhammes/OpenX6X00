@@ -26,8 +26,10 @@
 #   x6100-winlink-mail abort             ends Pat's connection under way, one the GUI no longer follows
 #
 # Every other command answers one JSON object or array; a failure is {"error": "..."} and the exit status 1.
-# The text to show is ASCII, as the GUI's fonts are: a letter with an accent loses it, an umlaut is written out
-# (ae, oe, ue, ss), what has no such form is "?". What is sent is as typed.
+# The text to show is Latin-1, which the GUI's fonts have (src/fonts/font_select.c: latin1_N behind every font):
+# what is beyond it is written out in it where it can be (typographic quotes and dashes, the euro sign, a letter
+# with an accent Latin-1 lacks), else "?". What is sent goes the same way: Pat writes a message in Latin-1, as
+# Winlink carries it, and would put "?" for the rest.
 # Pat's HTTP guard (tools/pat, 0001) takes 127.0.0.1 as the Host; what changes something is sent with jQuery's
 # X-Requested-With, as Pat's own page sends it.
 #
@@ -70,7 +72,8 @@ BAND_RE = re.compile(r"[0-9]{1,4}c?m")
 LIST_MAX = 300                 # messages a list gives, the newest
 GATEWAYS_MAX = 80
 RECENT_MAX = 6
-BODY_MAX = 64 * 1024           # characters of a body shown on the radio; the rest is in the web mailbox
+BODY_MAX = 16 * 1024           # characters of a body shown on the radio (an LVGL label measures up to 32767 px,
+                               # some 1200 lines); the rest is in the web mailbox
 TO_MAX = 512
 SUBJECT_MAX = 128              # Pat refuses longer (fbb.Validate)
 HEADERS = {"X-Requested-With": "XMLHttpRequest"}
@@ -187,31 +190,32 @@ def when(s):
         return "", 0
 
 
-FOLD = {"ä": "ae", "ö": "oe", "ü": "ue", "Ä": "Ae", "Ö": "Oe", "Ü": "Ue", "ß": "ss", "æ": "ae", "Æ": "AE",
-        "ø": "o", "Ø": "O", "å": "a", "Å": "A", "œ": "oe", "Œ": "OE", "ł": "l", "Ł": "L", "đ": "d", "Đ": "D",
-        "\u2018": "'", "\u2019": "'", "\u201a": "'", "\u201c": '"', "\u201d": '"', "\u201e": '"', "\u2013": "-",
-        "\u2014": "-", "\u2026": "...", "\u00a0": " ", "\u00b0": "deg", "\u20ac": "EUR", "\u00b5": "u"}
+# Beyond Latin-1: written out where it has no form there (NFKD then takes what is left: ł is not split, so it is
+# here; č, ő and the like lose their mark)
+FOLD = {"œ": "oe", "Œ": "OE", "ł": "l", "Ł": "L", "đ": "d", "Đ": "D", "\u2018": "'", "\u2019": "'", "\u201a": "'",
+        "\u201c": '"', "\u201d": '"', "\u201e": '"', "\u2013": "-", "\u2014": "-", "\u2026": "...", "\u20ac": "EUR",
+        "\u2022": "*", "\u00a0": " "}
 
 
-def ascii_char(c):
-    if " " <= c <= "~" or c in "\n\t":
+def screen_char(c):
+    if " " <= c <= "~" or c in "\n\t" or "\u00a1" <= c <= "\u00ff":
         return c
     if c in FOLD:
         return FOLD[c]
     if unicodedata is not None:
-        base = "".join(b for b in unicodedata.normalize("NFKD", c) if " " <= b <= "~")
+        base = "".join(b for b in unicodedata.normalize("NFKD", c) if " " <= b <= "~" or "\u00a1" <= b <= "\u00ff")
         if base:
             return base
     return "?" if ord(c) >= 160 else " "
 
 
 def clean(text, limit):
-    """Text for the radio's screen: ASCII, no control characters but the line ends and tabs, at most limit
+    """Text for the radio's screen: Latin-1, no control characters but the line ends and tabs, at most limit
     characters"""
     text = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
     out, n = [], 0
     for c in text:
-        a = ascii_char(c)
+        a = screen_char(c)
         out.append(a)
         n += len(a)
         if n >= limit:
@@ -237,14 +241,18 @@ def check_box(box, mid=None):
         raise Fail("not a message ID")
 
 
+def summaries(msgs):
+    out = [summary(m) for m in msgs if isinstance(m, dict)]
+    out.sort(key=lambda m: m["ts"], reverse=True)
+    return out[:LIST_MAX]
+
+
 def cmd_list(box):
     check_box(box)
     msgs = get_json(f"/api/mailbox/{box}")
     if not isinstance(msgs, list):
         raise Fail("Pat's answer could not be read")
-    out = [summary(m) for m in msgs if isinstance(m, dict)]
-    out.sort(key=lambda m: m["ts"], reverse=True)
-    return out[:LIST_MAX]
+    return summaries(msgs)
 
 
 def cmd_read(box, mid):
@@ -278,7 +286,10 @@ def cmd_send():
     if not isinstance(m, dict):
         raise Fail("the message could not be read")
     to, cc = str(m.get("to") or "").strip(), str(m.get("cc") or "").strip()
-    subject, body = one_line(m.get("subject"), 1000), str(m.get("body") or "")
+    # in Latin-1, as Pat writes it (its "?" for the rest written out where it can be); the subject on one line
+    subject = " ".join("".join(screen_char(c) if c.isprintable() else " " for c in str(m.get("subject") or ""))
+                       .split())
+    body = "".join(screen_char(c) if c.isprintable() or c in "\r\n\t" else " " for c in str(m.get("body") or ""))
     if not split_addrs(to) and not split_addrs(cc):
         raise Fail("To is empty")
     if len(to) > TO_MAX or len(cc) > TO_MAX:
@@ -382,8 +393,8 @@ def cmd_gateways(band=""):
     top = []
     for r in read_recent():
         scheme, call, f = parse_url(r["url"])
-        if scheme != mode:
-            continue
+        if scheme != mode or (band and r["url"] not in known):
+            continue        # another modem's, or (with a band chosen) a gateway on another band
         g = dict(known.get(r["url"]) or {"call": call, "grid": "", "dist": -1, "khz": f, "dial": f, "modes": "",
                                          "url": r["url"]})
         g["recent"] = True
@@ -527,6 +538,7 @@ def cmd_session(url):
     t.start()
     skip = old_log
     stdin_open = True
+    pending = b""              # what came on stdin, not a whole line yet (read unbuffered: select sees it all)
     end_at = None
     try:
         while True:
@@ -537,14 +549,19 @@ def cmd_session(url):
             fds = [ws] + ([sys.stdin] if stdin_open else [])
             ready = [ws] if ws.pending() else select.select(fds, [], [], 0.2)[0]
             if sys.stdin in ready:
-                line = sys.stdin.readline()
-                if not line:
+                try:
+                    chunk = os.read(sys.stdin.fileno(), 65536)
+                except OSError:
+                    chunk = b""
+                if not chunk:
                     stdin_open = False         # the GUI gone: the connection goes on, as one from the mailbox would
-                else:
-                    line = line.strip()
+                pending += chunk
+                while b"\n" in pending:
+                    raw, pending = pending.split(b"\n", 1)
+                    line = raw.decode("utf-8", "replace").strip()
                     if line in ("abort", "abort!"):
                         request("POST", "/api/disconnect" + ("?dirty=true" if line == "abort!" else ""))
-                    else:
+                    elif line:
                         try:
                             ans = json.loads(line).get("prompt")
                             ws.send({"prompt_response": {"id": str(ans["id"]), "value": str(ans["value"])}})
@@ -603,11 +620,15 @@ def cmd_abort():
 
 def cmd_view(box):
     check_box(box)
-    st = cmd_status()
-    return {"status": st, "list": cmd_list(box) if st["pat"] else []}
+    boxes = {}
+    st = cmd_status(boxes)
+    if not st["pat"]:
+        return {"status": st, "list": []}
+    return {"status": st, "list": summaries(boxes[box]) if box in boxes else cmd_list(box)}
 
 
-def cmd_status():
+def cmd_status(boxes=None):
+    """boxes: the inbox's and the outbox's messages as Pat gave them, for view to use again"""
     sup = read_kv(STATUS)
     conf = read_kv(CONF)
     out = {"enabled": conf.get("enabled") == "1", "state": sup.get("state", "off"), "text": sup.get("text", "Off"),
@@ -626,6 +647,8 @@ def cmd_status():
             except Fail:
                 continue
             msgs = msgs if isinstance(msgs, list) else []
+            if boxes is not None:
+                boxes[box] = msgs
             out[box] = len(msgs)
             if box == "in":
                 out["unread"] = sum(1 for m in msgs if isinstance(m, dict) and m.get("Unread"))

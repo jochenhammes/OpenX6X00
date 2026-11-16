@@ -690,7 +690,7 @@ void main_screen_action(press_action_t action) {
             if ((action >= ACTION_APP_RTTY && action <= ACTION_APP_CHANNELS) || action == ACTION_APP_PROPAGATION ||
                 action == ACTION_APP_SCAN || action == ACTION_APP_IRADIO || action == ACTION_APP_ZELLO ||
                 action == ACTION_APP_FLIGHTS || action == ACTION_APP_AERO || action == ACTION_APP_CB ||
-                action == ACTION_APP_METEO) {
+                action == ACTION_APP_METEO || action == ACTION_APP_MAIL) {
                 main_screen_start_app(action);
             }
             break;
