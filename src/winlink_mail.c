@@ -431,7 +431,7 @@ static int list_n(void) {
 }
 
 static const char *modem_name(void) {
-    return status && !strcmp(jstr(status, "transport"), "varahf") ? "Mercury" : "ARDOP";
+    return status && jstr(status, "modem_name")[0] ? jstr(status, "modem_name") : "ARDOP";
 }
 
 /* ---- Refresh: the state, the box shown --------------------------------------------------------------------------- */

@@ -320,6 +320,16 @@ def run(root):
     check(not any(l.startswith("Pat ") or "Starting HTTP service" in l for l in logs),
           "the log from before the session not repeated")
 
+    # Mercury and XARA: Pat's VARA HF transport, the gateways that run VARA
+    for m, name in (("mercury", "Mercury"), ("xara", "XARA")):
+        root.conf(enabled=1, modem=m)
+        rc, st, _ = helper(root, "status")
+        rc2, gws, _ = helper(root, "gateways")
+        check(rc == 0 and st["transport"] == "varahf" and st["modem_name"] == name and rc2 == 0
+              and [g["call"] for g in gws] == ["N0GWB"] and gws[0]["url"].startswith("varahf:///N0GWB"),
+              f"{name}: VARA HF gateways ({gws})")
+    root.conf(enabled=1)
+
     # off: nothing asked
     root.conf(enabled=0)
     rc, st, _ = helper(root, "status")

@@ -150,9 +150,17 @@ def password_where():
     return "pat" if isinstance(pw, str) and pw else "none"
 
 
+MODEM_NAMES = {"ardop": "ARDOP", "mercury": "Mercury", "xara": "XARA"}   # x6100-winlink's modem= choices
+
+
+def modem():
+    m = read_kv(CONF).get("modem")
+    return m if m in MODEM_NAMES else "ardop"
+
+
 def transport():
-    """Pat's transport for the chosen modem: ARDOP's, or VARA HF's for Mercury"""
-    return "varahf" if read_kv(CONF).get("modem") == "mercury" else "ardop"
+    """Pat's transport for the chosen modem: ARDOP's, or VARA HF's for Mercury and XARA"""
+    return "ardop" if modem() == "ardop" else "varahf"
 
 
 # ---- messages ---------------------------------------------------------------------------------------------------
@@ -604,7 +612,8 @@ def cmd_status():
     conf = read_kv(CONF)
     out = {"enabled": conf.get("enabled") == "1", "state": sup.get("state", "off"), "text": sup.get("text", "Off"),
            "password": password_where(), "modem": sup.get("modem", "off"), "mycall": conf.get("mycall", ""),
-           "transport": transport(), "last_text": sup.get("last_text", ""), "last_next": sup.get("last_next", ""),
+           "transport": transport(), "modem_name": MODEM_NAMES[modem()],
+           "last_text": sup.get("last_text", ""), "last_next": sup.get("last_next", ""),
            "last_result": sup.get("last_result", ""), "last_gateway": sup.get("last_gateway", ""),
            "last_time": int(sup["last_time"]) if sup.get("last_time", "").isdigit() else 0,
            "pat": False, "connected": False, "dialing": False}
