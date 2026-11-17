@@ -297,11 +297,15 @@ echo "== XARA, the VARA-compatible Winlink modem (tools/xara/build.sh): one ARMv
 # toolchain (glibc 2.36, the GUI's), which a tree built for the first time makes here, the first step of its build
 XARA_CC=$BR/build/host/bin/arm-buildroot-linux-gnueabihf-gcc
 (cd $BR/build && make toolchain)
-XARA_BIN=$(CC=$XARA_CC bash $GUI/tools/xara/build.sh)
-[ -x "$XARA_BIN" ]
+# A test build goes on without XARA when its source can't be fetched (x0rro/xara took v0.1.3, its tag and its
+# commit down in November 2026): the image then has no /usr/bin/xara, and x6100-winlink says so if XARA is chosen
 sed -i "/_CONF_OPTS += -DXARA_BINARY=/d" $GUI_MK
-sed -i "s|^\$(eval \$(cmake-package))|${GUI_VAR}_CONF_OPTS += -DXARA_BINARY=$XARA_BIN\n&|" $GUI_MK
-grep -q "^${GUI_VAR}_CONF_OPTS += -DXARA_BINARY=$XARA_BIN" $GUI_MK
+if XARA_BIN=$(CC=$XARA_CC bash $GUI/tools/xara/build.sh) && [ -x "$XARA_BIN" ]; then
+    sed -i "s|^\$(eval \$(cmake-package))|${GUI_VAR}_CONF_OPTS += -DXARA_BINARY=$XARA_BIN\n&|" $GUI_MK
+    grep -q "^${GUI_VAR}_CONF_OPTS += -DXARA_BINARY=$XARA_BIN" $GUI_MK
+else
+    echo "::warning::XARA not built (its source could not be fetched): the image has no XARA modem"
+fi
 
 echo "== RADE, the RADE app's modem (tools/rade/build.sh): static libraries for the GUI, built with the same gcc"
 # rade_c (RADE V1) and the Opus fork with FARGAN, pinned and checked, kept in $HOME/.cache/openx6x00/rade; the GUI's
